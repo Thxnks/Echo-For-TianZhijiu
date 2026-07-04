@@ -47,6 +47,12 @@ DISTILL_EVERY_MESSAGES = 8
 # 每轮最多带多少条记忆进 context
 MEMORY_LIMIT = 50
 
+# ---- 本地长期记忆向量检索 ----
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
+MEMORY_VECTOR_TOP_N = int(os.getenv("MEMORY_VECTOR_TOP_N", "8"))
+MEMORY_VECTOR_MIN_SCORE = float(os.getenv("MEMORY_VECTOR_MIN_SCORE", "0.35"))
+
 # ---- “在玩手机但没理它”→ Bark 推送（靠 iOS 快捷指令上报）----
 # 多久内 ping 过算“此刻在玩手机”
 PHONE_ACTIVE_WINDOW_MINUTES = 10

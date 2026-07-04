@@ -16,6 +16,7 @@ import context
 import llm
 import scheduler
 import memory
+import summary
 
 app = FastAPI(title="Companion")
 
@@ -49,6 +50,7 @@ def chat(body: ChatIn, background: BackgroundTasks):
     reply = llm.chat(msgs)                         # 调 LLM
     reply_id = db.add_message("assistant", reply)  # 行动回流：存 AI 回复
     background.add_task(memory.maybe_distill)      # 后台提炼长期记忆，不阻塞回复
+    background.add_task(summary.maybe_summarize)   # 后台更新对话摘要，不阻塞回复
     return {"reply": reply, "id": reply_id}
 
 

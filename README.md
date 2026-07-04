@@ -1,18 +1,29 @@
-# 小满 · 陪伴型 Agent（最小闭环）
+# Echo for TianZhijiu
 
-一个能在你 iPhone/iPad 上聊天、并会**主动给你发消息**的私人陪伴 agent。
+Echo for TianZhijiu — 能在你 iPhone/iPad 上聊天、并会**主动给你发消息**的私人陪伴 agent。
 数据全在你自己电脑上，注重隐私。
 
 ## 它现在能做什么
 - 用 PWA 聊天页和 AI 聊天（可加到 iPhone 主屏，像个 App）
 - AI 会在你长时间不说话时，**主动通过 Bark 推送一条消息**到你手机
 - 聊天记录、状态都存在本地 `companion.db`，不过任何第三方平台
+- **本地语义记忆**：自动提炼关于你的事实，用 embedding 向量检索相关记忆
+- **滚动对话摘要**：长对话自动生成摘要，让 AI 记住上下文不丢失
 
 ## 架构
 ```
-iPhone(PWA 聊天 + Bark 收推送)  ←→  你电脑上的 FastAPI 后端  →  DeepSeek/Claude API
-                                         └ SQLite(本地数据)
+PWA 聊天界面
+  ↕
+FastAPI 后端
+  ↕
+DeepSeek 聊天 / 记忆提炼 / 对话摘要
+  ↕
+SQLite 本地消息、session、记忆、摘要
+  ↕
+本地 embedding 语义检索（sentence-transformers / bge-small-zh）
 ```
+
+当前阶段**不需要** Milvus / PostgreSQL / Chroma，全部跑在 SQLite + 本地模型上，零外部依赖。未来数据量大后可迁移至 PostgreSQL + pgvector。
 
 ---
 
@@ -26,11 +37,18 @@ iPhone(PWA 聊天 + Bark 收推送)  ←→  你电脑上的 FastAPI 后端  →
 ```powershell
 py -m pip install -r requirements.txt
 ```
+> 首次安装 `sentence-transformers` 会自动下载 embedding 模型（约 100MB，一次性的），请耐心等待。
 
 ### 3. 配置 .env
 把 `.env.example` 复制一份改名为 `.env`，填上：
 - `LLM_API_KEY`：去 https://platform.deepseek.com 注册拿一个 key
 - `BARK_URL`：稍后配（见下），先留空也能聊天
+- embedding 相关配置已有默认值，无需改动
+
+### 3.5 补写旧记忆向量（如果有旧 companion.db）
+```powershell
+.\.venv\Scripts\python.exe scripts\backfill_embeddings.py
+```
 
 ### 4. 启动后端
 ```powershell
@@ -59,7 +77,7 @@ py -m uvicorn main:app --host 0.0.0.0 --port 8000
 - 电脑关机/睡眠时后端就停了，AI 不会主动发消息。想 24 小时常驻，以后租台云服务器把这套代码丢上去即可。
 - 想改 AI 的性格：改 `config.py` 里的 `PERSONA`。
 
-## 下一步（还没做）
-- 长期记忆（向量检索）→ 升级到 PostgreSQL + pgvector
+## 下一步
+- 角色显示名（目前叫 Claude）独立决定
 - 敏感信息脱敏
 - 工具调用（查天气/日程等）

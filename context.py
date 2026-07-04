@@ -1,10 +1,13 @@
-"""build_context()：每一轮发给 LLM 的内容是动态拼装的（帖子第2点）。
+"""build_context()：每一轮发给 LLM 的内容是动态拼装的。
 
 这是整个系统的核心。聊天和"主动找你"都用它，只是 trigger 不同。
+记忆检索：语义向量 > bigram > 兜底。
 """
+import math
 from datetime import datetime, timezone
 import config
 import db
+import embedder
 
 
 def _human_idle(last_user_time) -> str:
@@ -19,54 +22,82 @@ def _human_idle(last_user_time) -> str:
     return f"距离用户上次说话已经过去约 {int(h / 24)} 天。"
 
 
+# ---- 相似度 ----
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """两个向量的余弦相似度。归一化向量等价于 dot product。"""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    # 归一化向量下直接返回 dot
+    return max(0.0, dot)
+
+
 # ---- 相关性记忆检索 ----
-# 思路：用字符 bigram（相邻两字）的重叠度来判断"这条记忆和当前话题有多相关"。
-# 中文没有空格分词，bigram 是不依赖任何第三方库的最简方案。
-# 等上数据库（pgvector 之类）后可以换成向量检索，但接口不变。
+# 优先用语义向量（embedding），没有 embedding 或向量检索失败时 fallback 到 bigram。
+# bigram 是不依赖任何第三方库的最简方案，中文友好。
 
-def _relevant_memories(query: str, top_n: int = 10) -> list[str]:
-    """从全部记忆里挑出和 query 最相关的 top_n 条。
-
-    - query 可以是用户输入，也可以是主动模式下的 proactive_hint
-    - 相关性用字符 bigram 重叠数打分
-    - 兜底：如果一条都没匹配到，返回最新的几条记忆
-    """
-    all_mem = db.all_memories(200)          # 从数据库拉全部记忆（目前量小，够用）
-    if not all_mem:
-        return []
-
-    query = query.strip()
-    # 太短的查询（如"嗯""好"）→ 直接返回最新记忆
-    if len(query) < 2:
-        return all_mem[-top_n:]
-
-    # 生成查询的 bigram 集合
+def _bigram_memories(query: str, candidates: list[dict], top_n: int) -> list[dict]:
+    """bigram fallback：用字符 bigram 重叠度打分，从 candidates 中挑出 top_n 条。"""
     q_bigrams = {query[i:i + 2] for i in range(len(query) - 1)}
     if not q_bigrams:
-        return all_mem[-top_n:]
-
-    # 给每条记忆打分
+        return []
     scored = []
-    for mem in all_mem:
-        m_bigrams = {mem[i:i + 2] for i in range(len(mem) - 1)}
+    for m in candidates:
+        fact = m["fact"]
+        m_bigrams = {fact[i:i + 2] for i in range(len(fact) - 1)}
         score = len(q_bigrams & m_bigrams)
-        scored.append((score, mem))
-
-    # 按分数降序排列
+        scored.append((score, m))
     scored.sort(key=lambda x: x[0], reverse=True)
+    return [m for s, m in scored if s > 0][:top_n]
 
-    # 先取有重叠的（真正相关的）
-    relevant = [m for s, m in scored if s > 0][:top_n]
 
-    # 兜底：相关的不够 top_n 条，用最新的记忆补足
-    if len(relevant) < min(top_n, 5):
-        for m in reversed(all_mem):          # 最新在尾部
-            if m not in relevant:
-                relevant.append(m)
-            if len(relevant) >= min(top_n, 5):
-                break
+def _relevant_memories(query: str, top_n: int = 8) -> list[str]:
+    """从全部记忆里挑出和 query 最相关的 top_n 条。
 
-    return relevant
+    策略：语义向量检索 → bigram fallback → 最近记忆兜底。
+    - query 太短：直接返回最近记忆（不浪费 embedding 计算）
+    - 有 embedding 的记忆用 cosine 相似度排序
+    - 没有 embedding 或全部没命中时 fallback 到 bigram
+    """
+    query = query.strip()
+    # 太短的查询（如"嗯""好"）→ 直接返回最近记忆
+    if len(query) < 2:
+        recent = db.all_memories(top_n)
+        return recent[-top_n:] if recent else []
+
+    all_rows = db.all_memory_rows(200)
+    if not all_rows:
+        return []
+
+    # 1. 尝试语义向量检索
+    q_vec = embedder.embed(query)
+    if q_vec:
+        scored = []
+        for row in all_rows:
+            if row.get("embedding"):
+                score = _cosine_similarity(q_vec, row["embedding"])
+                if score >= config.MEMORY_VECTOR_MIN_SCORE:
+                    scored.append((score, row["fact"]))
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=True)
+            result = [fact for _, fact in scored[:top_n]]
+            # 标记命中记忆（用于后续分析热度）
+            for fact in result:
+                try:
+                    db.touch_memory(fact)
+                except Exception:
+                    pass
+            return result
+
+    # 2. Fallback: bigram
+    bigram_result = _bigram_memories(query, all_rows, top_n)
+    if bigram_result:
+        return [m["fact"] for m in bigram_result]
+
+    # 3. 兜底：返回最新记忆
+    recent = db.all_memories(top_n)
+    return recent[-top_n:] if recent else []
 
 
 def build_context(user_input: str | None = None, proactive_hint: str | None = None) -> list[dict]:
@@ -77,14 +108,22 @@ def build_context(user_input: str | None = None, proactive_hint: str | None = No
     now = datetime.now().strftime("%Y-%m-%d %H:%M %A")
     idle = _human_idle(db.last_user_message_time())
 
-    # 1. 基础身份 + 当前时间 + 距上次对话多久 + 相关性记忆（system 层）
+    # 1. 基础身份 + 当前时间 + 距上次对话多久（system 层）
     system = (
         f"{config.PERSONA}\n\n"
         f"【当前时间】{now}\n"
         f"【对话间隔】{idle}\n"
     )
 
-    # 1.5 长期记忆：只带和当前话题【相关】的（相关性检索替代全量 dump）
+    # 1.5 滚动对话摘要（如果有）
+    summary_row = db.get_session_summary()
+    if summary_row and summary_row.get("summary"):
+        system += (
+            "\n【最近对话摘要 — 本段对话到目前为止发生的重要事件和用户提到的关键信息】\n"
+            f"{summary_row['summary']}\n"
+        )
+
+    # 1.6 长期记忆：语义向量检索，只带和当前话题【相关】的
     query = (user_input or proactive_hint or "").strip()
     if query:
         relevant = _relevant_memories(query)

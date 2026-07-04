@@ -1,10 +1,13 @@
 """SQLite 数据层。所有聊天记录、状态都存在本地 companion.db 文件里。
 
-帖子第5点：数据库是"关系连续性的底座"。这里先做最小版：
+表：
 - messages：聊天历史（用户/AI/主动消息都进这里）
 - meta：键值表，存"上次主动找你的时间""当前心情"等状态
-等加长期记忆时，再加 memories 表 + 向量检索。
+- memories：长期记忆事实 + embedding 向量
+- sessions：对话分组
+- session_summaries：滚动对话摘要
 """
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,10 +52,30 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS session_summaries (
+                session_id INTEGER PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                updated_until_message_id INTEGER DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+        """)
         # 迁移：老库的 messages 没有 session_id 列，补上
         cols = [r[1] for r in c.execute("PRAGMA table_info(messages)").fetchall()]
         if "session_id" not in cols:
             c.execute("ALTER TABLE messages ADD COLUMN session_id INTEGER")
+
+        # 迁移：memories 增加 embedding / source / importance / last_used_at
+        mem_cols = [r[1] for r in c.execute("PRAGMA table_info(memories)").fetchall()]
+        if "embedding" not in mem_cols:
+            c.execute("ALTER TABLE memories ADD COLUMN embedding TEXT")
+        if "source" not in mem_cols:
+            c.execute("ALTER TABLE memories ADD COLUMN source TEXT DEFAULT 'distill'")
+        if "importance" not in mem_cols:
+            c.execute("ALTER TABLE memories ADD COLUMN importance INTEGER DEFAULT 1")
+        if "last_used_at" not in mem_cols:
+            c.execute("ALTER TABLE memories ADD COLUMN last_used_at TEXT")
+
     _ensure_default_session()
 
 
@@ -142,22 +165,68 @@ def last_user_message_time():
     return datetime.fromisoformat(row["created_at"]) if row else None
 
 
-def add_memory(fact: str):
-    """存一条长期记忆事实；fact 唯一，重复的自动忽略。"""
+def add_memory(fact: str, embedding: list[float] | None = None,
+                source: str = "distill", importance: int = 1):
+    """存一条长期记忆事实；fact 唯一，重复的自动忽略。
+    embedding 用 JSON 字符串保存，可为 None（先存事实，后补向量）。
+    """
+    embedding_json = json.dumps(embedding) if embedding else None
     with _conn() as c:
         c.execute(
-            "INSERT OR IGNORE INTO memories (fact, created_at) VALUES (?,?)",
-            (fact, _now()),
+            "INSERT OR IGNORE INTO memories (fact, embedding, source, importance, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (fact, embedding_json, source, importance, _now()),
         )
 
 
 def all_memories(limit: int = 200):
-    """取最近 limit 条记忆，按时间正序返回（老的在前）。"""
+    """取最近 limit 条记忆的事实文本列表（向后兼容旧接口）。"""
     with _conn() as c:
         rows = c.execute(
             "SELECT fact FROM memories ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
     return list(reversed([r["fact"] for r in rows]))
+
+
+def all_memory_rows(limit: int = 200) -> list[dict]:
+    """取最近 limit 条记忆的完整行（含 embedding / source / importance / last_used_at）。"""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, fact, embedding, source, importance, last_used_at, created_at "
+            "FROM memories ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    result = []
+    for r in reversed(rows):
+        d = dict(r)
+        # 把 JSON 字符串还原为 list，方便调用方直接用
+        if d.get("embedding"):
+            try:
+                d["embedding"] = json.loads(d["embedding"])
+            except (json.JSONDecodeError, TypeError):
+                d["embedding"] = None
+        else:
+            d["embedding"] = None
+        result.append(d)
+    return result
+
+
+def update_memory_embedding(fact: str, embedding: list[float]):
+    """为已有 memory 补写 embedding 向量。"""
+    embedding_json = json.dumps(embedding) if embedding else None
+    with _conn() as c:
+        c.execute(
+            "UPDATE memories SET embedding=? WHERE fact=?",
+            (embedding_json, fact),
+        )
+
+
+def touch_memory(fact: str):
+    """更新 last_used_at，标记这条记忆被检索命中过。"""
+    with _conn() as c:
+        c.execute(
+            "UPDATE memories SET last_used_at=? WHERE fact=?",
+            (_now(), fact),
+        )
 
 
 def get_meta(key: str, default=None):
@@ -173,3 +242,41 @@ def set_meta(key: str, value: str):
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+
+# ---- 滚动对话摘要 ----
+
+def get_session_summary(session_id: int | None = None) -> dict | None:
+    """获取当前或指定 session 的摘要。"""
+    if session_id is None:
+        session_id = current_session_id()
+    with _conn() as c:
+        row = c.execute(
+            "SELECT session_id, summary, updated_until_message_id, updated_at "
+            "FROM session_summaries WHERE session_id=?", (session_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_session_summary(session_id: int, summary: str, updated_until_message_id: int):
+    """写入或更新 session 摘要。"""
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO session_summaries (session_id, summary, updated_until_message_id, updated_at) "
+            "VALUES (?,?,?,?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "summary=excluded.summary, updated_until_message_id=excluded.updated_until_message_id, "
+            "updated_at=excluded.updated_at",
+            (session_id, summary, updated_until_message_id, _now()),
+        )
+
+
+def message_count_in_session(session_id: int | None = None) -> int:
+    """当前 session 的消息总数。"""
+    if session_id is None:
+        session_id = current_session_id()
+    with _conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE session_id=?", (session_id,)
+        ).fetchone()
+    return row["n"] if row else 0

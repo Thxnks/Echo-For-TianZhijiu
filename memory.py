@@ -1,10 +1,10 @@
 """长期记忆：每积累几轮对话，自动把"关于用户值得记住的事"提炼成事实存起来。
 
-帖子第1点：记忆是一个可检索系统，不是一段固定人设。
-这里是简版——提炼成事实存进 memories 表，build_context 时全量带上（量大了再上向量检索）。
+提炼后自动生成 embedding 向量，供语义检索使用。
 """
 import db
 import llm
+import embedder
 import config
 
 _DISTILL_SYSTEM = (
@@ -40,7 +40,9 @@ def maybe_distill():
         for line in out.splitlines():
             fact = line.strip().lstrip("-•*0123456789. ").strip()
             if fact and fact != "无":
-                db.add_memory(fact)
+                # 为新提炼的事实生成 embedding 并一起存
+                vector = embedder.embed(fact)
+                db.add_memory(fact, embedding=vector if vector else None)
 
     # 把"已提炼到哪"的指针推进到最新一条
     db.set_meta("last_distill_id", str(max(m["id"] for m in new_msgs)))
